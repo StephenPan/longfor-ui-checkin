@@ -1,0 +1,33 @@
+{
+  "enabled": false,
+  "channel": "小程序",
+  "shortcut": "龙湖天街.lnk",
+  "account_hash": "",
+  "success_markers": [
+    "每日签到",
+    "今日已获得"
+  ],
+  "evidence_type": "growth",
+  "reward_kind": "成长值",
+  "route": [
+    {
+      "action": "prepare-sign-entry",
+      "require": "赚珑珠"
+    },
+    {
+      "action": "click-sign-entry",
+      "require": "赚珑珠",
+      "submits": true
+    }
+  ],
+  "return_route": [
+    {
+      "action": "close-applet"
+    }
+  ],
+  "login": {
+    "enabled": true,
+    "quick_login_consent": false,
+    "phone_hash": ""
+  }
+}

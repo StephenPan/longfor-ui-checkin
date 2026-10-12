@@ -1,0 +1,50 @@
+{
+  "enabled": false,
+  "channel": "APP",
+  "device_serial": "",
+  "package": "com.longfor.supera",
+  "wake_mode": "unprotected",
+  "account_hash": "",
+  "sign_page_title": "每日签到",
+  "success_markers": [
+    "APP签到 奖励翻倍",
+    "今日已获得"
+  ],
+  "login": {
+    "enabled": true,
+    "method": "sms",
+    "phone_hash": "",
+    "app_consent_authorized": false,
+    "code_source": "user_input",
+    "profiles": [
+      {
+        "name": "member_login_entry",
+        "selector": {
+          "text": "立即登录",
+          "resource-id": "com.longfor.supera:id/tv_nickname"
+        },
+        "required_labels": [
+          "登录查看成长值及会员等级",
+          "会员"
+        ]
+      },
+      {
+        "name": "sms_agreement",
+        "selector": {
+          "resource-id": "com.longfor.supera:id/login_agree_checked"
+        },
+        "required_ids": [
+          "com.longfor.supera:id/login_root_view",
+          "com.longfor.supera:id/login_agree_tv"
+        ],
+        "required_labels": [
+          "手机快捷登录"
+        ],
+        "required_checked": {
+          "com.longfor.supera:id/login_agree_checked": "false"
+        },
+        "consent_required": true
+      }
+    ]
+  }
+}
