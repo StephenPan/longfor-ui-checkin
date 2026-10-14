@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 from tempfile import TemporaryDirectory
@@ -55,6 +56,20 @@ class CriticalSafeguards(unittest.TestCase):
         for hour, minute, expected in [(5, 59, False), (6, 0, True), (7, 29, True), (7, 30, False)]:
             self.assertEqual(checkin.in_window(datetime(2026, 10, 9, hour, minute, tzinfo=checkin.BEIJING)), expected)
         self.assertTrue(checkin.in_window(datetime(2026, 10, 8, 22, 10, tzinfo=timezone.utc)))
+
+    def test_navigation_uses_longer_bounded_startup_wait_without_signing(self):
+        import hashlib
+        account = "测试账号"
+        snapshot = page(account, "会员")
+        config = {"enabled": True, "shortcut": "龙湖天街.lnk", "account_hash": hashlib.sha256(account.encode()).hexdigest()}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / config["shortcut"]).touch()
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(checkin, "ROOT", root), patch.object(checkin.os, "startfile", create=True), patch.object(checkin.time, "sleep"), patch.object(checkin, "wait_for", return_value=snapshot) as wait, patch.object(checkin, "perform") as action, patch.object(checkin, "log"):
+                self.assertEqual(checkin.execute(scheduled=False, navigate_only=True), 0)
+            self.assertEqual(wait.call_args.kwargs["timeout"], 120)
+            action.assert_not_called()
 
     def test_calendar_rewards_do_not_prove_credit(self):
         self.assertIsNone(checkin.growth_evidence(page("每日签到", "+ 5明天", "5成长值")))

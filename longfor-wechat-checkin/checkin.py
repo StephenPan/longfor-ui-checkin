@@ -19,6 +19,7 @@ BEIJING = timezone(timedelta(hours=8))
 STOP_WORDS = ("验证码", "滑块", "安全验证", "操作异常", "访问异常", "请先登录", "立即登录", "授权登录", "手机号登录", "短信验证")
 TERMINAL = {"verified", "already_signed", "submission_intent", "uncertain"}
 CHALLENGE_WORDS = ("验证码", "滑块", "安全验证", "操作异常", "访问异常", "短信验证")
+STARTUP_TIMEOUT_SECONDS = 120
 
 
 def now():
@@ -316,7 +317,7 @@ def execute(scheduled=True, navigate_only=False):
         raise RuntimeError("官方小程序快捷方式缺失，已停止")
     os.startfile(str(shortcut))
     time.sleep(3)
-    snapshot = wait_for(lambda value: "会员" in names(value) or login_required(value) or account_matches(value, config.get("account_hash", "")), allow_login=True, scheduled=scheduled)
+    snapshot = wait_for(lambda value: "会员" in names(value) or login_required(value) or account_matches(value, config.get("account_hash", "")), timeout=STARTUP_TIMEOUT_SECONDS, allow_login=True, scheduled=scheduled)
     if active_page(snapshot) in ("每日签到", "珑珠明细"):
         perform({"action": "click-class", "class": "back", "require": active_page(snapshot)}, scheduled)
         snapshot = bridge()
