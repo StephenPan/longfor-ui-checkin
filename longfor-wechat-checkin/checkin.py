@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import msvcrt
 import os
 from pathlib import Path
@@ -92,10 +93,10 @@ def ensure_logged_in(snapshot, config, scheduled):
         attempted.add(key)
         bridge("login-click", **step)
         log("login_step", step="phone_authorize" if "phone_hash" in step else step["name"])
-        snapshot = wait_for(lambda value: (not login_required(value) and account_matches(value, config.get("account_hash", ""))) or any(marker in names(value) for marker in ("欢迎登录龙湖", "服务协议及隐私保护", "申请注册并验证你的手机号", "立即登录")), allow_login=True, scheduled=scheduled)
+        snapshot = wait_for(lambda value: (not login_required(value) and account_matches(value, config.get("account_hash", ""))) or any(marker in names(value) for marker in ("欢迎登录龙湖", "服务协议及隐私保护", "申请注册并验证你的手机号", "立即登录")), allow_login=True, scheduled=scheduled, phase="login_transition")
         # Wait for the page to actually change before selecting another action.
         if login_required(snapshot) and login_step(snapshot, config) == step:
-            snapshot = wait_for(lambda value: account_matches(value, config.get("account_hash", "")) and not login_required(value) or login_required(value) and login_step(value, config) != step, allow_login=True, scheduled=scheduled)
+            snapshot = wait_for(lambda value: account_matches(value, config.get("account_hash", "")) and not login_required(value) or login_required(value) and login_step(value, config) != step, allow_login=True, scheduled=scheduled, phase="login_transition")
     raise RuntimeError("限定次数内未完成登录，停止签到")
 
 
@@ -167,17 +168,39 @@ def bridge(action="inspect", **options):
     return payload
 
 
-def wait_for(predicate, timeout=35, allow_login=False, scheduled=False):
+def snapshot_summary(snapshot):
+    page = active_page(snapshot)
+    return {"element_count": len(snapshot.get("elements", [])),
+            "page": page if page in ("main", "每日签到", "珑珠明细") else "other",
+            "member_tab": "会员" in names(snapshot), "home_tab": "首页" in names(snapshot),
+            "login_page": login_required(snapshot),
+            "close_label_count": sum(label in ("关闭", "关闭广告", "关闭活动弹窗") for label in names(snapshot))}
+
+
+def wait_for(predicate, timeout=35, allow_login=False, scheduled=False, phase="page", startup=False):
     deadline = time.monotonic() + timeout
+    snapshot = {}
     while time.monotonic() < deadline:
-        snapshot = bridge()
+        if scheduled and not in_window(now()):
+            raise RuntimeError("已到7:30，停止等待登录或签到页面")
+        try:
+            snapshot = bridge(foreground="true") if startup else bridge()
+        except RuntimeError as error:
+            # The official shortcut can need more than three seconds to create
+            # its window. Other errors, including multiple windows, stay fatal.
+            if not startup or str(error) != "Expected one visible 龙湖天街 WeChatAppEx window; found 0":
+                raise
+            snapshot = {}
+            time.sleep(1)
+            continue
         if scheduled and not in_window(now()):
             raise RuntimeError("已到7:30，停止等待登录或签到页面")
         (ensure_no_challenge if allow_login else ensure_safe)(snapshot)
         if predicate(snapshot):
             return snapshot
         time.sleep(1)
-    raise RuntimeError("页面在规定时间内未加载为可确认状态，已停止")
+    log("page_wait_timeout", phase=phase, snapshot=snapshot_summary(snapshot))
+    raise RuntimeError("页面在规定时间内未加载为可确认状态（阶段：" + phase + "），已停止")
 
 
 def sign_card(snapshot):
@@ -204,6 +227,8 @@ def button_score(image, card, window):
     import numpy as np
     left, top = card["x"] - window["x"], card["y"] - window["y"]
     with Image.open(image) as screenshot:
+        if screenshot.size != (window["width"], window["height"]) or card["width"] <= 0 or card["height"] <= 0 or left < 0 or top < 0 or left + card["width"] > screenshot.width or top + card["height"] > screenshot.height:
+            raise RuntimeError("截图尺寸或签到卡片位置与当前窗口不一致，停止识别")
         normalized = screenshot.crop((left, top, left + card["width"], top + card["height"])).resize((529, 66))
         button = np.array(normalized.crop((428, 0, 529, 66)).convert("L"))
     scores = []
@@ -214,8 +239,20 @@ def button_score(image, card, window):
     return max(scores) if scores else -1.0
 
 
+def card_visible(snapshot, card):
+    window = snapshot["window"]
+    tab_tops = [e["y"] for e in snapshot["elements"] if e.get("class_name", "").startswith("tabbar_item ")]
+    bottom = min(tab_tops) if tab_tops else window["y"] + window["height"] - 90
+    return not card.get("offscreen") and window["y"] + 110 < card["y"] and card["y"] + card["height"] < bottom
+
+
+def entry_signature(snapshot, card):
+    return tuple(snapshot["window"][key] for key in ("x", "y", "width", "height")) + tuple(card.get(key) for key in ("automation_id", "x", "y", "width", "height", "offscreen"))
+
+
 def prepare_sign_entry(scheduled):
     capture = ROOT / "entry-check.png"
+    mismatches = 0
     try:
         for attempt in range(13):
             if scheduled and not in_window(now()):
@@ -224,18 +261,30 @@ def prepare_sign_entry(scheduled):
             ensure_safe(snapshot)
             card = sign_card(snapshot)
             window = snapshot["window"]
-            tab_tops = [e["y"] for e in snapshot["elements"] if e.get("class_name", "").startswith("tabbar_item ")]
-            bottom = min(tab_tops) if tab_tops else window["y"] + window["height"] - 90
             top = window["y"] + 110
-            visible = not card.get("offscreen") and top < card["y"] and card["y"] + card["height"] < bottom
-            if visible:
-                snapshot = bridge(capture=str(capture))
-                ensure_safe(snapshot)
-                card = sign_card(snapshot)
-                score = button_score(capture, card, snapshot["window"])
-                if score < 0.96:
-                    raise RuntimeError("签到按钮图像与已核实的‘去签到’不一致，已停止")
-                return card
+            if card_visible(snapshot, card):
+                captured = bridge(capture=str(capture))
+                ensure_safe(captured)
+                captured_card = sign_card(captured)
+                after = bridge()
+                ensure_safe(after)
+                after_card = sign_card(after)
+                if not card_visible(captured, captured_card) or not card_visible(after, after_card) or not (entry_signature(snapshot, card) == entry_signature(captured, captured_card) == entry_signature(after, after_card)):
+                    log("entry_layout_moved", attempt=attempt + 1, signing=False)
+                    time.sleep(0.8)
+                    continue
+                if scheduled and not in_window(now()):
+                    raise RuntimeError("已到7:30，停止签到入口核对")
+                score = button_score(capture, captured_card, captured["window"])
+                log("entry_image_check", score=round(score, 5) if math.isfinite(score) else None, threshold=0.96,
+                    card_size=[captured_card["width"], captured_card["height"]], attempt=attempt + 1, signing=False)
+                if not math.isfinite(score) or score < 0.96:
+                    mismatches += 1
+                    if mismatches >= 3:
+                        raise RuntimeError("签到按钮连续3次与已核实的‘去签到’不一致，已停止")
+                    time.sleep(1)
+                    continue
+                return after_card
             if attempt == 12:
                 break
             bridge("scroll-member", direction="up" if card["y"] <= top else "down")
@@ -295,12 +344,12 @@ def finish_success(config, state, scheduled):
             result.write("\n签到已核实，但退出未确认：" + str(error))
 
 
-def execute(scheduled=True, navigate_only=False):
+def execute(scheduled=True, navigate_only=False, verify_entry=False):
     config = load_json(ROOT / "config.json", {})
-    if not config.get("enabled") and not navigate_only:
+    if not config.get("enabled") and not (navigate_only or verify_entry):
         log("disabled", reason=config.get("pending_reason", "尚未完成真实入口验证"))
         return 3
-    if not navigate_only and (not config.get("route") or not config.get("success_markers") or not any(step.get("submits") for step in config["route"])):
+    if not (navigate_only or verify_entry) and (not config.get("route") or not config.get("success_markers") or not any(step.get("submits") for step in config["route"])):
         raise RuntimeError("实际签到入口、到账标记或提交步骤尚未配置，拒绝执行")
     if scheduled and not in_window(now()):
         log("outside_window")
@@ -308,7 +357,7 @@ def execute(scheduled=True, navigate_only=False):
     state_path = ROOT / "state.json"
     state = load_json(state_path, {})
     date = now().date().isoformat()
-    if blocks_reentry(state, date) and not navigate_only:
+    if blocks_reentry(state, date) and not (navigate_only or verify_entry):
         log("duplicate_skipped", status=state.get("status"))
         return 0
     # The official shortcut opens only this applet; never type into WeChat chats.
@@ -317,16 +366,20 @@ def execute(scheduled=True, navigate_only=False):
         raise RuntimeError("官方小程序快捷方式缺失，已停止")
     os.startfile(str(shortcut))
     time.sleep(3)
-    snapshot = wait_for(lambda value: "会员" in names(value) or login_required(value) or account_matches(value, config.get("account_hash", "")), timeout=STARTUP_TIMEOUT_SECONDS, allow_login=True, scheduled=scheduled)
+    snapshot = wait_for(lambda value: "会员" in names(value) or login_required(value) or account_matches(value, config.get("account_hash", "")) or active_page(value) in ("每日签到", "珑珠明细"), timeout=STARTUP_TIMEOUT_SECONDS, allow_login=True, scheduled=scheduled, phase="startup", startup=True)
     if active_page(snapshot) in ("每日签到", "珑珠明细"):
         perform({"action": "click-class", "class": "back", "require": active_page(snapshot)}, scheduled)
-        snapshot = bridge()
+        snapshot = wait_for(lambda value: active_page(value) == "main" and ("会员" in names(value) or login_required(value)), allow_login=True, scheduled=scheduled, phase="startup_return")
     if active_page(snapshot) != "main":
         raise RuntimeError("当前打开了未校准的子页面，已停止，需回到首页或会员页")
     snapshot = ensure_logged_in(snapshot, config, scheduled)
     if not account_matches(snapshot, config.get("account_hash", "")):
         raise RuntimeError("当前账号与已校准账号不一致，已停止")
     log("account_verified", channel="小程序")
+    if verify_entry:
+        prepare_sign_entry(scheduled)
+        log("entry_verified", signing=False)
+        return 0
     if navigate_only:
         log("navigation_verified", signing=False)
         return 0
@@ -340,7 +393,7 @@ def execute(scheduled=True, navigate_only=False):
                 write_json(state_path, state)
                 submitted = True
             perform(step, scheduled)
-        snapshot = wait_for(lambda value: primary_evidence(value, config) is not None)
+        snapshot = wait_for(lambda value: primary_evidence(value, config) is not None, phase="credit_after_submission")
         evidence = primary_evidence(snapshot, config)
         state = {"date": date, "status": "verified", "time": now().isoformat(), "channel": "小程序", "reward": evidence}
         write_json(state_path, state)
@@ -357,7 +410,7 @@ def execute(scheduled=True, navigate_only=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["scheduled", "verify-navigation", "manual", "status"], default="scheduled", nargs="?")
+    parser.add_argument("mode", choices=["scheduled", "verify-navigation", "verify-entry", "manual", "status"], default="scheduled", nargs="?")
     arguments = parser.parse_args()
     if arguments.mode == "status":
         print(json.dumps(load_json(ROOT / "state.json", {}), ensure_ascii=False, indent=2))
@@ -379,7 +432,7 @@ def main():
             if arguments.mode == "scheduled" and not in_window(now()):
                 return execute(scheduled=True)
             with channel_session(session_guard):
-                return execute(scheduled=arguments.mode == "scheduled", navigate_only=arguments.mode == "verify-navigation")
+                return execute(scheduled=arguments.mode == "scheduled", navigate_only=arguments.mode == "verify-navigation", verify_entry=arguments.mode == "verify-entry")
         except Exception as error:
             log("failed", error=str(error), manual_attention=True)
             (ROOT / "最新执行结果.txt").write_text(now().strftime("%Y-%m-%d %H:%M:%S") + " 北京时间\n签到未确认完成：" + str(error), encoding="utf-8")

@@ -61,8 +61,18 @@ def primary_evidence(nodes, config):
     return {"items": rewards, "display": "、".join(item["display"] for item in rewards)} if rewards else None
 
 
-def wait_snapshot(phone, predicate, guard=lambda: None, timeout=35, allow_login=False):
+def snapshot_summary(nodes, package):
+    ids = [node.get("resource-id", "") for node in nodes]
+    return {"node_count": len(nodes), "member_tab": "会员" in labels(nodes),
+            "login_page": login_required(nodes),
+            "daily_page": any(node.get("resource-id") == package + ":id/id_browser_header_title" and node.get("text") == "每日签到" for node in nodes),
+            "market_popup": package + ":id/img_market" in ids,
+            "market_close_count": ids.count(package + ":id/img_close")}
+
+
+def wait_snapshot(phone, predicate, guard=lambda: None, timeout=35, allow_login=False, phase="page"):
     deadline = time.monotonic() + timeout
+    nodes = []
     while time.monotonic() < deadline:
         guard()
         try:
@@ -78,7 +88,8 @@ def wait_snapshot(phone, predicate, guard=lambda: None, timeout=35, allow_login=
         if predicate(nodes):
             return nodes
         time.sleep(1)
-    raise RuntimeError("页面在限定时间内未显示可确认结果，需要人工检查")
+    log("page_wait_timeout", phase=phase, snapshot=snapshot_summary(nodes, phone.package))
+    raise RuntimeError("页面在限定时间内未显示可确认结果（阶段：" + phase + "），需要人工检查")
 
 
 def restore_login(phone, config, nodes, guard):
@@ -105,27 +116,62 @@ def restore_login(phone, config, nodes, guard):
         attempted.add(key)
         phone.login_tap(profile, guard)
         log("login_step", channel="APP", step=profile.get("name", "已核实登录入口"))
-        nodes = wait_snapshot(phone, lambda value: not login_required(value) or choose_login_profile(value, config.get("login", {}).get("profiles", [])) != profile, guard, allow_login=True)
+        nodes = wait_snapshot(phone, lambda value: not login_required(value) or choose_login_profile(value, config.get("login", {}).get("profiles", [])) != profile, guard, allow_login=True, phase="login_transition")
     raise RuntimeError("限定次数内未完成APP登录")
 
 
+def sign_page_open(nodes, config):
+    headers = [node for node in nodes if node.get("resource-id") == config["package"] + ":id/id_browser_header_title"]
+    return bool(config.get("sign_page_title")) and len(headers) == 1 and headers[0].get("text") == config["sign_page_title"]
+
+
+def market_popup_open(nodes, package):
+    return any(node.get("resource-id") == package + ":id/img_market" for node in nodes)
+
+
 def navigate_member(phone, config, guard):
-    nodes = wait_snapshot(phone, lambda value: "会员" in labels(value) or login_required(value), guard, allow_login=True)
-    nodes = restore_login(phone, config, nodes, guard)
-    ids = [node.get("resource-id", "") for node in nodes]
-    if phone.package + ":id/img_market" in ids:
-        phone.tap({"resource-id": phone.package + ":id/img_close"},
-                  required_ids=(phone.package + ":id/img_market",), time_guard=guard)
-        nodes = wait_snapshot(phone, lambda value: "会员" in labels(value) or login_required(value), guard, allow_login=True)
+    requested_member = False
+
+    def ready(value):
+        if login_required(value) or sign_page_open(value, config) or market_popup_open(value, phone.package):
+            return True
+        if requested_member:
+            return any(node.get("resource-id") == phone.package + ":id/tv_nickname" for node in value)
+        return "会员" in labels(value)
+
+    dismissed = 0
+    returned = False
+    for _ in range(7):
+        nodes = wait_snapshot(phone, ready, guard, allow_login=True, phase="member_account" if requested_member else "startup")
+        # A retained WebView can still display yesterday's "today" reward.
+        # Only return from it here; never adopt its credit as today's result.
+        if sign_page_open(nodes, config):
+            if returned:
+                raise RuntimeError("旧签到页返回后仍未退出，停止操作")
+            phone.back_from_page(config["sign_page_title"], guard)
+            returned = True
+            log("retained_sign_page_returned", signing=False)
+            continue
+        if market_popup_open(nodes, phone.package):
+            if dismissed >= 2:
+                raise RuntimeError("官方活动弹窗反复出现，停止操作")
+            log("market_popup_detected", snapshot=snapshot_summary(nodes, phone.package), signing=False)
+            phone.tap({"resource-id": phone.package + ":id/img_close"},
+                      required_ids=(phone.package + ":id/img_market",), time_guard=guard)
+            dismissed += 1
+            log("market_popup_dismissed", signing=False)
+            continue
         nodes = restore_login(phone, config, nodes, guard)
-    if not account_matches(nodes, config):
+        if sign_page_open(nodes, config) or market_popup_open(nodes, phone.package):
+            continue
+        if account_matches(nodes, config) and "我的珑珠" in labels(nodes):
+            return nodes
+        if requested_member or "我的珑珠" in labels(nodes):
+            raise RuntimeError("会员账号或页面无法核实，停止签到")
         phone.tap({"text": "会员", "resource-id": phone.package + ":id/tab_text"},
                   required_labels=("首页", "会员"), time_guard=guard)
-        nodes = wait_snapshot(phone, lambda value: account_matches(value, config) or login_required(value), guard, allow_login=True)
-        nodes = restore_login(phone, config, nodes, guard)
-    if "我的珑珠" not in labels(nodes) or not account_matches(nodes, config):
-        raise RuntimeError("会员账号或页面无法核实，停止签到")
-    return nodes
+        requested_member = True
+    raise RuntimeError("限定次数内未恢复首页或会员页")
 
 
 def finish_success(phone, config, state):
@@ -137,7 +183,7 @@ def finish_success(phone, config, state):
         if primary_evidence(nodes, config):
             phone.require_foreground()
             phone.shell("input", "keyevent", "4")
-            nodes = wait_snapshot(phone, lambda value: account_matches(value, config))
+            nodes = wait_snapshot(phone, lambda value: account_matches(value, config), phase="cleanup_member")
         if not account_matches(nodes, config):
             raise RuntimeError("未能返回已校准会员页，停止退出操作")
         state["growth_after"] = member_growth(nodes, config)
@@ -155,18 +201,18 @@ def finish_success(phone, config, state):
         state["reward"]["display"] + ("\n已退出APP页面并确认手机熄屏。" if outcome == "screen_off" else "\n退出或熄屏未确认，请检查手机。"), encoding="utf-8")
 
 
-def execute(scheduled=True, navigate_only=False):
+def execute(scheduled=True, navigate_only=False, verify_entry=False):
     config = load_json(ROOT / "config.json", {})
     if scheduled and not in_window(now()):
         log("outside_window")
         return 0
-    if not config.get("enabled") and not navigate_only:
+    if not config.get("enabled") and not (navigate_only or verify_entry):
         log("disabled", reason=config.get("pending_reason", "尚未完成真实签到验证"))
         return 3
     if not config.get("success_markers") or not config.get("account_hash") or config.get("wake_mode") != "unprotected":
         raise RuntimeError("实际页面或无密码唤醒方式尚未核实")
     date = now().date().isoformat()
-    if blocks_reentry(load_json(ROOT / "state.json", {}), date) and not navigate_only:
+    if blocks_reentry(load_json(ROOT / "state.json", {}), date) and not (navigate_only or verify_entry):
         log("duplicate_skipped")
         return 0
 
@@ -179,9 +225,11 @@ def execute(scheduled=True, navigate_only=False):
     nodes = navigate_member(phone, config, guard)
     before = member_growth(nodes, config)
     log("account_verified", channel="APP")
-    if navigate_only:
+    if navigate_only or verify_entry:
+        if verify_entry:
+            phone.prepare_sign_card(config["account_hash"], guard)
         phone.finish_and_sleep()
-        log("navigation_and_sleep_verified", signing=False)
+        log("entry_and_sleep_verified" if verify_entry else "navigation_and_sleep_verified", signing=False)
         return 0
     submitted = False
 
@@ -192,7 +240,7 @@ def execute(scheduled=True, navigate_only=False):
 
     try:
         phone.tap_sign_card(config["account_hash"], guard, before_submit=intent)
-        nodes = wait_snapshot(phone, lambda value: primary_evidence(value, config) is not None, guard)
+        nodes = wait_snapshot(phone, lambda value: primary_evidence(value, config) is not None, guard, phase="credit_after_submission")
         state = {"date": date, "status": "verified", "time": now().isoformat(), "channel": "APP",
                  "reward": primary_evidence(nodes, config), "growth_before": before}
         write_json(ROOT / "state.json", state)
@@ -208,7 +256,7 @@ def execute(scheduled=True, navigate_only=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["scheduled", "manual", "verify-navigation", "status"], nargs="?", default="scheduled")
+    parser.add_argument("mode", choices=["scheduled", "manual", "verify-navigation", "verify-entry", "status"], nargs="?", default="scheduled")
     args = parser.parse_args()
     if args.mode == "status":
         print(json.dumps(load_json(ROOT / "state.json", {}), ensure_ascii=False, indent=2))
@@ -230,7 +278,7 @@ def main():
             if args.mode == "scheduled" and not in_window(now()):
                 return execute(scheduled=True)
             with channel_session(session_guard):
-                return execute(scheduled=args.mode == "scheduled", navigate_only=args.mode == "verify-navigation")
+                return execute(scheduled=args.mode == "scheduled", navigate_only=args.mode == "verify-navigation", verify_entry=args.mode == "verify-entry")
         except Exception as error:
             log("failed", error=str(error), manual_attention=True)
             (ROOT / "最新执行结果.txt").write_text(now().strftime("%Y-%m-%d %H:%M:%S") + " 北京时间\nAPP自动签到未确认完成：" + str(error), encoding="utf-8")

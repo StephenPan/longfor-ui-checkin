@@ -235,6 +235,16 @@ class Android:
         self.require_foreground()
         self.shell("input", "tap", str(x), str(y))
 
+    def back_from_page(self, expected_title, time_guard=lambda: None):
+        nodes = self.snapshot()
+        ensure_safe(nodes)
+        headers = [node for node in nodes if node.get("resource-id") == self.package + ":id/id_browser_header_title"]
+        if not expected_title or len(headers) != 1 or headers[0].get("text") != expected_title:
+            raise RuntimeError("当前子页面标题无法核实，停止返回操作")
+        time_guard()
+        self.require_foreground()
+        self.shell("input", "keyevent", "4")
+
     def prepare_sign_card(self, account_hash, time_guard=lambda: None):
         capture = ROOT / "entry-check.png"
         try:
