@@ -18,6 +18,7 @@ public class DesktopBridge {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -45,7 +46,16 @@ public class DesktopBridge {
         if(windows.Count!=1)throw new Exception("Expected one visible 龙湖天街 WeChatAppEx window; found "+windows.Count);
         return windows[0];
     }
-    static void Foreground(IntPtr h) { ShowWindow(h,9);SetForegroundWindow(h);Thread.Sleep(350);if(GetForegroundWindow()!=h)throw new Exception("Target window is not foreground; refusing input"); }
+    static void Foreground(IntPtr h) {
+        for(int attempt=0;attempt<3;attempt++) {
+            if(!IsWindow(h)||!IsWindowVisible(h))throw new Exception("Target window disappeared; refusing input");
+            if(GetForegroundWindow()==h)return;
+            if(IsIconic(h))ShowWindow(h,9);
+            SetForegroundWindow(h);Thread.Sleep(350);
+            if(GetForegroundWindow()==h)return;
+        }
+        throw new Exception("Target window is not foreground; refusing input");
+    }
     static List<Dictionary<string,object>> Elements(IntPtr h) {
         var root=AutomationElement.FromHandle(h);
         var found=root.FindAll(TreeScope.Descendants,Condition.TrueCondition);

@@ -37,6 +37,8 @@ def names(snapshot):
 
 
 def ensure_safe(snapshot):
+    if login_required(snapshot):
+        raise RuntimeError("登录状态已失效，需要恢复原账号后才能签到")
     for name in names(snapshot):
         if any(word in name for word in STOP_WORDS):
             raise RuntimeError("登录、验证或异常页面：需要人工处理，已停止点击")
@@ -48,7 +50,22 @@ def ensure_no_challenge(snapshot):
 
 
 def login_required(snapshot):
-    return any(marker in names(snapshot) for marker in ("立即登录", "欢迎登录龙湖", "申请注册并验证你的手机号", "手机号登录", "授权登录"))
+    return any(marker in label for label in names(snapshot) for marker in ("立即登录", "欢迎登录龙湖", "申请注册并验证你的手机号", "手机号登录", "授权登录", "服务协议及隐私保护", "登录失效", "登录已过期", "请重新登录", "请先登录"))
+
+
+def login_stage(snapshot):
+    labels = names(snapshot)
+    if "申请注册并验证你的手机号" in labels:
+        return "phone" if any(re.fullmatch(r"1\d{2}\*{4}\d{4}", label) for label in labels) else "loading"
+    if "服务协议及隐私保护" in labels:
+        return "consent" if "同意" in labels else "loading"
+    if "欢迎登录龙湖" in labels:
+        return "quick" if "快捷登录" in labels and "我已阅读并同意" in labels else "loading"
+    if "立即登录" in labels and "登录查看成长值及会员等级" in labels:
+        return "entry"
+    if not login_required(snapshot) and "会员" in labels and "首页" in labels:
+        return "member"
+    return "unknown"
 
 
 def login_step(snapshot, config):
@@ -57,27 +74,29 @@ def login_step(snapshot, config):
     login = config.get("login", {})
     if not login.get("enabled"):
         raise RuntimeError("重新登录流程尚未配置")
-    if "申请注册并验证你的手机号" in labels:
+    stage = login_stage(snapshot)
+    if stage == "phone":
         candidates = [label for label in labels if re.fullmatch(r"1\d{2}\*{4}\d{4}", label)]
         if len(candidates) != 1 or hashlib.sha256(candidates[0].encode()).hexdigest() != login.get("phone_hash") or "上次登录" not in labels:
             raise RuntimeError("微信授权手机号与已核实号码不一致，停止登录")
         return {"name": candidates[0], "phone_hash": login["phone_hash"]}
-    if "服务协议及隐私保护" in labels:
+    if stage == "consent":
         if not login.get("quick_login_consent"):
             raise RuntimeError("登录协议确认尚未获得用户授权")
         return {"name": "同意", "consent": "true"}
-    if "欢迎登录龙湖" in labels and "快捷登录" in labels:
+    if stage == "quick":
         return {"name": "快捷登录"}
-    if "立即登录" in labels and "登录查看成长值及会员等级" in labels:
+    if stage == "entry":
         return {"name": "立即登录"}
-    if "会员" in labels and "首页" in labels:
+    if stage == "member":
         return {"name": "会员"}
     raise RuntimeError("登录页面没有已核实的微信快捷登录入口，需要人工处理")
 
 
 def ensure_logged_in(snapshot, config, scheduled):
     attempted = set()
-    for _ in range(7):
+    attempted_stages = set()
+    for _ in range(8):
         ensure_no_challenge(snapshot)
         if not login_required(snapshot) and account_matches(snapshot, config.get("account_hash", "")):
             ensure_safe(snapshot)
@@ -86,17 +105,22 @@ def ensure_logged_in(snapshot, config, scheduled):
             raise RuntimeError("当前会员账号与已核实账号不一致，停止签到")
         if scheduled and not in_window(now()):
             raise RuntimeError("已到7:30，停止登录和签到")
+        stage = login_stage(snapshot)
+        log("login_state", stage=stage, login_required=login_required(snapshot), signing=False)
+        if stage in ("loading", "unknown"):
+            snapshot = wait_for(lambda value: account_matches(value, config.get("account_hash", "")) and not login_required(value) or login_stage(value) not in ("loading", "unknown"), allow_login=True, scheduled=scheduled, phase="login_controls_ready")
+            continue
         step = login_step(snapshot, config)
         key = tuple(sorted(step.items()))
         if key in attempted:
             raise RuntimeError("登录步骤未完成，不重复发送登录请求")
         attempted.add(key)
+        attempted_stages.add(stage)
         bridge("login-click", **step)
         log("login_step", step="phone_authorize" if "phone_hash" in step else step["name"])
-        snapshot = wait_for(lambda value: (not login_required(value) and account_matches(value, config.get("account_hash", ""))) or any(marker in names(value) for marker in ("欢迎登录龙湖", "服务协议及隐私保护", "申请注册并验证你的手机号", "立即登录")), allow_login=True, scheduled=scheduled, phase="login_transition")
-        # Wait for the page to actually change before selecting another action.
-        if login_required(snapshot) and login_step(snapshot, config) == step:
-            snapshot = wait_for(lambda value: account_matches(value, config.get("account_hash", "")) and not login_required(value) or login_required(value) and login_step(value, config) != step, allow_login=True, scheduled=scheduled, phase="login_transition")
+        # Poll page state, not the next action: partial authorization controls
+        # are loading states, and an unchanged view never repeats a request.
+        snapshot = wait_for(lambda value: (not login_required(value) and (account_matches(value, config.get("account_hash", "")) or "我的珑珠" in names(value))) or login_stage(value) not in attempted_stages | {"loading", "unknown"}, allow_login=True, scheduled=scheduled, phase="login_after_" + stage)
     raise RuntimeError("限定次数内未完成登录，停止签到")
 
 
@@ -174,12 +198,14 @@ def snapshot_summary(snapshot):
             "page": page if page in ("main", "每日签到", "珑珠明细") else "other",
             "member_tab": "会员" in names(snapshot), "home_tab": "首页" in names(snapshot),
             "login_page": login_required(snapshot),
+            "login_stage": login_stage(snapshot),
             "close_label_count": sum(label in ("关闭", "关闭广告", "关闭活动弹窗") for label in names(snapshot))}
 
 
 def wait_for(predicate, timeout=35, allow_login=False, scheduled=False, phase="page", startup=False):
     deadline = time.monotonic() + timeout
     snapshot = {}
+    focus_failures = 0
     while time.monotonic() < deadline:
         if scheduled and not in_window(now()):
             raise RuntimeError("已到7:30，停止等待登录或签到页面")
@@ -188,6 +214,22 @@ def wait_for(predicate, timeout=35, allow_login=False, scheduled=False, phase="p
         except RuntimeError as error:
             # The official shortcut can need more than three seconds to create
             # its window. Other errors, including multiple windows, stay fatal.
+            if startup and str(error) == "Target window is not foreground; refusing input":
+                focus_failures += 1
+                # This was an inspection, before input. Read background state
+                # for diagnosis only; never bypass the foreground input guard.
+                try:
+                    snapshot = bridge()
+                    ensure_no_challenge(snapshot)
+                except RuntimeError as inspect_error:
+                    if str(inspect_error) != "Expected one visible 龙湖天街 WeChatAppEx window; found 0":
+                        raise
+                    snapshot = {}
+                log("startup_focus_retry", attempt=focus_failures, snapshot=snapshot_summary(snapshot), signing=False)
+                if focus_failures >= 3:
+                    raise RuntimeError("小程序连续3次无法恢复前台，尚未点击登录或签到，请检查窗口遮挡") from error
+                time.sleep(0.8)
+                continue
             if not startup or str(error) != "Expected one visible 龙湖天街 WeChatAppEx window; found 0":
                 raise
             snapshot = {}
